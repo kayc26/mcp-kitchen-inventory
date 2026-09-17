@@ -5,10 +5,11 @@ connected. It can only guess: no clock lives in a context window. This
 server is the smallest honest fix — and the pattern generalizes to any
 instrument you can imagine. See docs/adr/ for every choice made here.
 """
-import json
 import os
 import re
 from datetime import datetime, timezone
+
+import psycopg
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
@@ -17,25 +18,69 @@ mcp = FastMCP(
     port=int(os.environ.get("PORT", 8000)),
 )
 
-# Kitchen inventory storage: two sections, fridge and freezer. Plain JSON
-# file, no database needed for this scale. Note: on Render's free tier the
-# disk is ephemeral, so this file will NOT persist across restarts/deploys
-# — accepted limitation, not a bug.
-STORAGE_FILE = os.path.join(os.path.dirname(__file__), "kitchen.json")
+# Kitchen inventory storage: two sections, fridge and freezer, backed by
+# Neon Postgres (DATABASE_URL). Replaces the earlier local JSON file, which
+# didn't survive restarts on Render's free tier — this does.
 LOCATIONS = ("fridge", "freezer")
 
-def _load_kitchen() -> dict:
-    if not os.path.exists(STORAGE_FILE):
-        return {loc: {} for loc in LOCATIONS}
-    with open(STORAGE_FILE) as f:
-        data = json.load(f)
-    for loc in LOCATIONS:
-        data.setdefault(loc, {})
+def _get_conn():
+    return psycopg.connect(os.environ["DATABASE_URL"])
+
+def _init_db() -> None:
+    with _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                location TEXT NOT NULL,
+                name TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                expiry TEXT NOT NULL DEFAULT '',
+                made_date TEXT NOT NULL DEFAULT '',
+                low_threshold TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (location, name)
+            )
+        """)
+
+_init_db()
+
+def _get_items(location: str | None = None) -> dict:
+    """{location: {name: {...}}} for one location, or all locations if None."""
+    query = "SELECT location, name, quantity, expiry, made_date, low_threshold FROM items"
+    params = ()
+    if location is not None:
+        query += " WHERE location = %s"
+        params = (location,)
+    with _get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+    data = {loc: {} for loc in LOCATIONS}
+    for loc, name, quantity, expiry, made_date, low_threshold in rows:
+        data[loc][name] = {
+            "quantity": quantity,
+            "expiry": expiry,
+            "made_date": made_date,
+            "low_threshold": low_threshold,
+        }
     return data
 
-def _save_kitchen(data: dict) -> None:
-    with open(STORAGE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def _upsert_item(location: str, name: str, item: dict) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO items (location, name, quantity, expiry, made_date, low_threshold)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (location, name) DO UPDATE SET
+                quantity = EXCLUDED.quantity,
+                expiry = EXCLUDED.expiry,
+                made_date = EXCLUDED.made_date,
+                low_threshold = EXCLUDED.low_threshold
+            """,
+            (location, name, item["quantity"], item["expiry"], item["made_date"], item["low_threshold"]),
+        )
+
+def _delete_item(location: str, name: str) -> bool:
+    """True if a row was deleted."""
+    with _get_conn() as conn:
+        cur = conn.execute("DELETE FROM items WHERE location = %s AND name = %s", (location, name))
+        return cur.rowcount > 0
 
 def _check_location(location: str) -> str | None:
     """None if valid, else an error message."""
@@ -93,16 +138,16 @@ def add_item(
     """
     if error := _check_location(location):
         return error
-    data = _load_kitchen()
-    data[location][name] = {
+    item = {
         "quantity": quantity,
         "expiry": expiry,
         "made_date": made_date,
         "low_threshold": low_threshold,
     }
-    _save_kitchen(data)
-    msg = f"Added '{name}' to the {location}. Current {location}: {data[location]}"
-    if _is_low(data[location][name]):
+    _upsert_item(location, name, item)
+    items = _get_items(location)[location]
+    msg = f"Added '{name}' to the {location}. Current {location}: {items}"
+    if _is_low(item):
         msg += f"\n⚠️ '{name}' is already at or below its low-stock threshold."
     return msg
 
@@ -114,12 +159,10 @@ def remove_item(name: str, location: str = "fridge") -> str:
     """
     if error := _check_location(location):
         return error
-    data = _load_kitchen()
-    if name not in data[location]:
+    if not _delete_item(location, name):
         return f"'{name}' is not in the {location}."
-    del data[location][name]
-    _save_kitchen(data)
-    return f"Removed '{name}' from the {location}. Current {location}: {data[location]}"
+    items = _get_items(location)[location]
+    return f"Removed '{name}' from the {location}. Current {location}: {items}"
 
 @mcp.tool()
 def list_inventory(location: str = "all") -> str:
@@ -129,7 +172,7 @@ def list_inventory(location: str = "all") -> str:
     """
     if location != "all" and (error := _check_location(location)):
         return error
-    data = _load_kitchen()
+    data = _get_items(None if location == "all" else location)
     sections = data if location == "all" else {location: data[location]}
     if not any(sections.values()):
         return "Empty." if location == "all" else f"The {location} is empty."
@@ -153,7 +196,7 @@ def check_low_stock(location: str = "all") -> str:
     """
     if location != "all" and (error := _check_location(location)):
         return error
-    data = _load_kitchen()
+    data = _get_items(None if location == "all" else location)
     sections = data if location == "all" else {location: data[location]}
     low = {
         f"{loc}/{name}": item
