@@ -93,6 +93,19 @@ def _leading_number(s: str) -> float | None:
     match = re.match(r"\s*(\d+(\.\d+)?)", s)
     return float(match.group(1)) if match else None
 
+def _parse_quantity(s: str) -> tuple[float, str] | tuple[None, None]:
+    """Split a quantity string into (number, unit), e.g. '2 cups' -> (2.0, 'cups').
+
+    (None, None) if there's no leading number to parse.
+    """
+    match = re.match(r"\s*(\d+(?:\.\d+)?)\s*(.*)", s)
+    if not match:
+        return None, None
+    return float(match.group(1)), match.group(2).strip()
+
+def _format_number(n: float) -> str:
+    return str(int(n)) if n == int(n) else str(n)
+
 def _is_low(item: dict) -> bool:
     """True if quantity has dropped to or below the item's low_threshold."""
     threshold = _leading_number(item.get("low_threshold", ""))
@@ -123,7 +136,18 @@ def add_item(
     low_threshold: str = "",
     location: str = "fridge",
 ) -> str:
-    """Add an item to the fridge or freezer (overwrites if it already exists).
+    """Add an item to the fridge or freezer.
+
+    If the item is already there and both the existing and new quantities
+    start with a number (e.g. "3" + "2" -> "5", "1 cup" + "2 cups" -> "3
+    cups"), the quantities are summed automatically. Otherwise (item not
+    present yet, or either quantity isn't numeric, e.g. "half a carton")
+    this call overwrites the quantity instead of summing it — it does not
+    know how to convert "half a carton" + "2" into a total. In that case,
+    call list_inventory first, work out the new total yourself (using
+    whatever real-world conversion applies), and pass that total here as
+    the quantity. expiry, made_date, and low_threshold always overwrite,
+    regardless.
 
     location is "fridge" or "freezer".
 
@@ -138,6 +162,13 @@ def add_item(
     """
     if error := _check_location(location):
         return error
+    existing = _get_items(location)[location].get(name)
+    if existing is not None:
+        old_number, old_unit = _parse_quantity(existing["quantity"])
+        new_number, new_unit = _parse_quantity(quantity)
+        if old_number is not None and new_number is not None:
+            unit = new_unit or old_unit
+            quantity = f"{_format_number(old_number + new_number)} {unit}".strip()
     item = {
         "quantity": quantity,
         "expiry": expiry,
