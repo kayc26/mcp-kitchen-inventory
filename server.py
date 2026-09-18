@@ -1,19 +1,17 @@
-"""your-first-instrument — a sense of time for a model that has none.
+"""fridge-inventory — a fridge/freezer inventory a model has no way to see.
 
-Why time? Ask your Claude "how long have we been talking?" WITHOUT this
-connected. It can only guess: no clock lives in a context window. This
-server is the smallest honest fix — and the pattern generalizes to any
-instrument you can imagine. See docs/adr/ for every choice made here.
+An AI model only knows what's in its context window — it can't see what's
+actually in your fridge. This server hands it that: add, remove, and list
+items, with low-stock flags. See docs/adr/ for every choice made here.
 """
 import os
 import re
-from datetime import datetime, timezone
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
-    "your-first-instrument",
+    "fridge-inventory",
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
 )
@@ -111,21 +109,6 @@ def _is_low(item: dict) -> bool:
     threshold = _leading_number(item.get("low_threshold", ""))
     quantity = _leading_number(item.get("quantity", ""))
     return threshold is not None and quantity is not None and quantity <= threshold
-
-@mcp.tool()
-def current_time() -> str:
-    """The current date and time (UTC and local)."""
-    now = datetime.now(timezone.utc)
-    return f"UTC: {now.isoformat()} · local: {datetime.now().isoformat()}"
-
-@mcp.tool()
-def seconds_since(iso_timestamp: str) -> str:
-    """Seconds elapsed since an ISO timestamp (e.g. '2026-09-10T17:15:00')."""
-    then = datetime.fromisoformat(iso_timestamp)
-    if then.tzinfo is None:
-        then = then.replace(tzinfo=timezone.utc)
-    delta = datetime.now(timezone.utc) - then
-    return f"{delta.total_seconds():.0f} seconds ({delta})"
 
 @mcp.tool()
 def add_item(

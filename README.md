@@ -1,4 +1,4 @@
-# your-first-instrument — the CAM MCP starter
+# fridge-inventory — the CAM MCP starter
 
 *A rig for your experiments, not a finished thing. Cloned in Session 3 of
 Computationally Assisted Metacognition (CIS 7000, Penn, Fall 2026).*
@@ -12,8 +12,9 @@ model cannot.
 
 ## What's in the rig
 
-- `server.py` — a small, working MCP server (a sense of time, ~40 lines).
-  Two tools work; the third is a stub with your name on it.
+- `server.py` — a small, working MCP server: a fridge/freezer inventory
+  tracker backed by Postgres. Four tools work; one is a stub with your name
+  on it.
 - `docs/adr/` — **the choices live here, not in the code.** Every decision
   this repo made for you is written down with its reasons, so you inherit
   understanding, not just files. Disagree with one? Write the next ADR.
@@ -54,11 +55,11 @@ the browser claude.ai can't — it calls from the cloud, which is exactly why
 deployment exists):
 
 ```bash
-claude mcp add --transport http first-instrument http://localhost:8000/mcp
+claude mcp add --transport http fridge-inventory http://localhost:8000/mcp
 ```
 
-Ask it: *"What time is it? How long have we been talking?"* The model still
-has no clock; it learned to consult one. Yours.
+Ask it: *"What's in my fridge? Add 2 eggs, expiry 2026-10-01."* The model
+still can't see inside your fridge; it learned to consult one. Yours.
 
 **To reach the browser claude.ai, a tunnel is REQUIRED** — claude.ai calls
 from Anthropic's cloud and can never see your laptop directly:
@@ -79,7 +80,7 @@ The tunnel dies with your terminal. For an instrument that outlives your laptop:
 1. **render.com** → Sign in **with GitHub** (the account holding your repo).
 2. **New +** → **Blueprint** → select your repo → **Apply**. (`render.yaml` does the rest.)
 3. ~2 minutes of build → copy your `https://….onrender.com` URL.
-4. claude.ai → Settings → Connectors → edit `first-instrument` → swap URL to the Render one + `/mcp`.
+4. claude.ai → Settings → Connectors → edit `fridge-inventory` → swap URL to the Render one + `/mcp`.
 
 Free-tier truth (ADR-0003): the instance naps when idle — first call after a nap
 takes ~30s. Fine for an instrument; now you know why.
