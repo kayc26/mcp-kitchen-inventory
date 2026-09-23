@@ -1,8 +1,9 @@
-"""fridge-inventory — a fridge/freezer inventory a model has no way to see.
+"""fridge-inventory — a food inventory a model has no way to see.
 
 An AI model only knows what's in its context window — it can't see what's
-actually in your fridge. This server hands it that: add, remove, and list
-items, with low-stock flags. See docs/adr/ for every choice made here.
+actually in your kitchen. This server hands it that: add, remove, and list
+food items across any storage location (fridge, freezer, pantry, ...), with
+low-stock flags. See docs/adr/ for every choice made here.
 """
 import os
 import re
@@ -12,14 +13,22 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "fridge-inventory",
+    instructions=(
+        "A food inventory: what food is on hand, where it's stored, how much "
+        "is left, and when it expires. Each item has a free-form storage "
+        "location — commonly \"fridge\", \"freezer\", or \"pantry\", but any "
+        "location works."
+    ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
 )
 
-# Kitchen inventory storage: two sections, fridge and freezer, backed by
-# Neon Postgres (DATABASE_URL). Replaces the earlier local JSON file, which
-# didn't survive restarts on Render's free tier — this does.
-LOCATIONS = ("fridge", "freezer")
+# Food inventory storage, backed by Neon Postgres (DATABASE_URL). Replaces the
+# earlier local JSON file, which didn't survive restarts on Render's free
+# tier — this does. Location is a free-form attribute of each item. Every
+# location ever used is remembered in the locations table, so it sticks
+# around (and shows up as empty) after its last item is removed.
+COMMON_LOCATIONS = ("fridge", "freezer", "pantry")
 
 def _get_conn():
     return psycopg.connect(os.environ["DATABASE_URL"])
@@ -37,11 +46,23 @@ def _init_db() -> None:
                 PRIMARY KEY (location, name)
             )
         """)
+        conn.execute("CREATE TABLE IF NOT EXISTS locations (name TEXT PRIMARY KEY)")
+        # Backfill: fridge and freezer always existed before locations were
+        # free-form, plus any location already holding items.
+        conn.execute("""
+            INSERT INTO locations (name)
+            SELECT 'fridge' UNION SELECT 'freezer' UNION SELECT DISTINCT location FROM items
+            ON CONFLICT DO NOTHING
+        """)
 
 _init_db()
 
 def _get_items(location: str | None = None) -> dict:
-    """{location: {name: {...}}} for one location, or all locations if None."""
+    """{location: {name: {...}}} for one location, or all locations if None.
+
+    Every known location appears (empty ones as {}), common locations first.
+    A specific location that isn't known returns {}.
+    """
     query = "SELECT location, name, quantity, expiry, made_date, low_threshold FROM items"
     params = ()
     if location is not None:
@@ -49,18 +70,33 @@ def _get_items(location: str | None = None) -> dict:
         params = (location,)
     with _get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
-    data = {loc: {} for loc in LOCATIONS}
+    known = _get_locations()
+    data = {loc: {} for loc in known if location is None or loc == location}
     for loc, name, quantity, expiry, made_date, low_threshold in rows:
-        data[loc][name] = {
+        data.setdefault(loc, {})[name] = {
             "quantity": quantity,
             "expiry": expiry,
             "made_date": made_date,
             "low_threshold": low_threshold,
         }
-    return data
+    return {loc: data[loc] for loc in sorted(data, key=_location_sort_key)}
+
+def _location_sort_key(location: str) -> tuple[int, str]:
+    if location in COMMON_LOCATIONS:
+        return (COMMON_LOCATIONS.index(location), "")
+    return (len(COMMON_LOCATIONS), location)
+
+def _get_locations() -> list[str]:
+    """Every known location, including ones that are currently empty."""
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT name FROM locations").fetchall()
+    return sorted((loc for (loc,) in rows), key=_location_sort_key)
 
 def _upsert_item(location: str, name: str, item: dict) -> None:
     with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO locations (name) VALUES (%s) ON CONFLICT DO NOTHING", (location,)
+        )
         conn.execute(
             """
             INSERT INTO items (location, name, quantity, expiry, made_date, low_threshold)
@@ -74,17 +110,37 @@ def _upsert_item(location: str, name: str, item: dict) -> None:
             (location, name, item["quantity"], item["expiry"], item["made_date"], item["low_threshold"]),
         )
 
+def _delete_location(location: str) -> bool:
+    """True if the location was deleted. Only deletes it if it holds no items."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM locations WHERE name = %s
+            AND NOT EXISTS (SELECT 1 FROM items WHERE location = %s)
+            """,
+            (location, location),
+        )
+        return cur.rowcount > 0
+
 def _delete_item(location: str, name: str) -> bool:
     """True if a row was deleted."""
     with _get_conn() as conn:
         cur = conn.execute("DELETE FROM items WHERE location = %s AND name = %s", (location, name))
         return cur.rowcount > 0
 
+def _normalize_location(location: str) -> str:
+    return location.strip().lower()
+
 def _check_location(location: str) -> str | None:
-    """None if valid, else an error message."""
-    if location not in LOCATIONS:
-        return f"location must be one of {LOCATIONS}, got '{location}'."
+    """None if valid (already normalized), else an error message."""
+    if not location:
+        return "location can't be empty, e.g. \"fridge\", \"freezer\", or \"pantry\"."
+    if location == "all":
+        return "\"all\" is reserved for listing every location; pick a specific location."
     return None
+
+def _format_locations(locations: list[str]) -> str:
+    return ", ".join(locations) if locations else "(none yet)"
 
 def _leading_number(s: str) -> float | None:
     """Pull the leading number out of a quantity string like '2 eggs' -> 2.0."""
@@ -119,7 +175,7 @@ def add_item(
     low_threshold: str = "",
     location: str = "fridge",
 ) -> str:
-    """Add an item to the fridge or freezer.
+    """Add a food item to the inventory at a storage location.
 
     If the item is already there and both the existing and new quantities
     start with a number (e.g. "3" + "2" -> "5", "1 cup" + "2 cups" -> "3
@@ -132,7 +188,12 @@ def add_item(
     the quantity. expiry, made_date, and low_threshold always overwrite,
     regardless.
 
-    location is "fridge" or "freezer".
+    location is any storage location, e.g. "fridge" (default), "freezer",
+    or "pantry" — these are common examples, not a fixed list. It's
+    trimmed and lowercased. A location that doesn't exist yet is created,
+    and the response says so and lists the existing locations, so double
+    check it wasn't a typo (if it was, move the item and call
+    remove_location on the typo).
 
     expiry and made_date are optional, format YYYY-MM-DD. made_date is for
     things you cooked or prepped yourself (leftovers, meal components) — use
@@ -143,9 +204,11 @@ def add_item(
     list_inventory and check_low_stock. Leave blank to skip the low-stock
     check for this item.
     """
+    location = _normalize_location(location)
     if error := _check_location(location):
         return error
-    existing = _get_items(location)[location].get(name)
+    existing_locations = _get_locations()
+    existing = _get_items(location).get(location, {}).get(name)
     if existing is not None:
         old_number, old_unit = _parse_quantity(existing["quantity"])
         new_number, new_unit = _parse_quantity(quantity)
@@ -161,35 +224,74 @@ def add_item(
     _upsert_item(location, name, item)
     items = _get_items(location)[location]
     msg = f"Added '{name}' to the {location}. Current {location}: {items}"
+    if location not in existing_locations:
+        msg += (
+            f"\n🆕 Created new location '{location}'. Existing locations: "
+            f"{_format_locations(existing_locations)}. If '{location}' was a "
+            "typo, remove the item, add it again under the right location, and "
+            f"call remove_location('{location}')."
+        )
     if _is_low(item):
         msg += f"\n⚠️ '{name}' is already at or below its low-stock threshold."
     return msg
 
 @mcp.tool()
 def remove_item(name: str, location: str = "fridge") -> str:
-    """Remove an item from the fridge or freezer (used up or thrown out).
+    """Remove a food item from the inventory (used up or thrown out).
 
-    location is "fridge" or "freezer".
+    location is the storage location the item is in, e.g. "fridge"
+    (default), "freezer", or "pantry" — any location string works. It's
+    trimmed and lowercased. The location is kept even after its last item
+    is removed; use remove_location to delete an empty location.
     """
+    location = _normalize_location(location)
     if error := _check_location(location):
         return error
     if not _delete_item(location, name):
-        return f"'{name}' is not in the {location}."
-    items = _get_items(location)[location]
+        return (
+            f"'{name}' is not in the {location}. Existing locations: "
+            f"{_format_locations(_get_locations())}."
+        )
+    items = _get_items(location).get(location)
+    if not items:
+        return f"Removed '{name}' from the {location}. The {location} is now empty."
     return f"Removed '{name}' from the {location}. Current {location}: {items}"
 
 @mcp.tool()
-def list_inventory(location: str = "all") -> str:
-    """The current inventory, flagging anything running low.
+def remove_location(location: str) -> str:
+    """Delete an empty storage location, e.g. one created by a typo.
 
-    location is "fridge", "freezer", or "all" (default) for both.
+    Only works on a location with no items in it — remove or move its items
+    first. Locations otherwise stick around after they empty out.
     """
-    if location != "all" and (error := _check_location(location)):
+    location = _normalize_location(location)
+    if error := _check_location(location):
         return error
-    data = _get_items(None if location == "all" else location)
-    sections = data if location == "all" else {location: data[location]}
-    if not any(sections.values()):
-        return "Empty." if location == "all" else f"The {location} is empty."
+    locations = _get_locations()
+    if location not in locations:
+        return f"There's no location '{location}'. Existing locations: {_format_locations(locations)}."
+    if not _delete_location(location):
+        items = _get_items(location).get(location, {})
+        return f"The {location} isn't empty, so it wasn't removed. It holds: {', '.join(items)}."
+    return f"Removed location '{location}'. Existing locations: {_format_locations(_get_locations())}."
+
+@mcp.tool()
+def list_inventory(location: str = "all") -> str:
+    """The current food inventory, grouped by location, flagging anything
+    running low.
+
+    location is "all" (default) for every location, or any specific
+    location to filter to it, e.g. "fridge", "freezer", or "pantry".
+    """
+    location = _normalize_location(location) or "all"
+    sections = _get_items(None if location == "all" else location)
+    if not sections:
+        if location == "all":
+            return "The inventory is empty."
+        return (
+            f"There's no location '{location}'. Existing locations: "
+            f"{_format_locations(_get_locations())}."
+        )
     lines = []
     for loc, items in sections.items():
         if not items:
@@ -204,23 +306,27 @@ def list_inventory(location: str = "all") -> str:
 
 @mcp.tool()
 def check_low_stock(location: str = "all") -> str:
-    """Just the items that are at or below their low_threshold, if any.
+    """Just the food items that are at or below their low_threshold, if any,
+    grouped by location.
 
-    location is "fridge", "freezer", or "all" (default) for both.
+    location is "all" (default) for every location, or any specific
+    location to filter to it, e.g. "fridge", "freezer", or "pantry".
     """
-    if location != "all" and (error := _check_location(location)):
-        return error
-    data = _get_items(None if location == "all" else location)
-    sections = data if location == "all" else {location: data[location]}
+    location = _normalize_location(location) or "all"
+    sections = _get_items(None if location == "all" else location)
+    if not sections and location != "all":
+        return (
+            f"There's no location '{location}'. Existing locations: "
+            f"{_format_locations(_get_locations())}."
+        )
     low = {
-        f"{loc}/{name}": item
+        loc: {name: item for name, item in items.items() if _is_low(item)}
         for loc, items in sections.items()
-        for name, item in items.items()
-        if _is_low(item)
     }
+    low = {loc: items for loc, items in low.items() if items}
     if not low:
         return "Nothing is running low."
-    return f"Running low: {low}"
+    return "Running low:\n" + "\n".join(f"{loc}: {items}" for loc, items in low.items())
 
 @mcp.tool()
 def my_tool() -> str:

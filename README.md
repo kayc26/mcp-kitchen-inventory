@@ -12,8 +12,9 @@ model cannot.
 
 ## What's in the rig
 
-- `server.py` — a small, working MCP server: a fridge/freezer inventory
-  tracker backed by Postgres. Four tools work; one is a stub with your name
+- `server.py` — a small, working MCP server: a food inventory
+  tracker (fridge, freezer, pantry, or any location you name) backed by
+  Postgres. Four tools work; one is a stub with your name
   on it.
 - `docs/adr/` — **the choices live here, not in the code.** Every decision
   this repo made for you is written down with its reasons, so you inherit
