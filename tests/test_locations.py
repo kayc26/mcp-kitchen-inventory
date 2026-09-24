@@ -160,3 +160,24 @@ def test_use_item_accepts_item_name_as_unit():
     assert "7 eggs left" in server.use_item(name, "1 egg", location="pantry")
     assert "Can't subtract" in server.use_item(name, "4 oz", location="pantry")
     server.remove_item(name, location="pantry")
+
+
+def test_singular_and_plural_names_match():
+    plural = f"{ITEM} strawberries"
+    server.add_item(plural, quantity="3", location="pantry")
+
+    assert "2 left" in server.use_item(f"{ITEM} strawberry", "1", location="pantry")
+    server.add_item(f"{ITEM} Strawberry", quantity="2", location="pantry")
+    assert server._get_items("pantry")["pantry"][plural]["quantity"] == "4"
+
+    msg = server.remove_item(f"{ITEM} strawberry", location="pantry")
+    assert f"Removed '{plural}'" in msg
+    assert plural not in server._get_items("pantry")["pantry"]
+
+
+def test_singular_forms():
+    for singular, plural in [("egg", "eggs"), ("strawberry", "strawberries"),
+                             ("cherry tomato", "cherry tomatoes"), ("sauce", "sauces")]:
+        assert server._singular_forms(singular) & server._singular_forms(plural)
+    assert not server._singular_forms("pecan") & server._singular_forms("peanuts")
+    assert server._singular_forms("hummus") & server._singular_forms("hummus")

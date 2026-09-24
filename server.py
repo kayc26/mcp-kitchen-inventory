@@ -141,12 +141,32 @@ def _normalize_name(name: str) -> str:
     """Trim, collapse whitespace, lowercase: "  Golden  Raisins " -> "golden raisins"."""
     return " ".join(name.split()).lower()
 
+def _singular_forms(name: str) -> set[str]:
+    """name plus the singulars its last word could be: "cherry tomatoes" ->
+    {"cherry tomatoes", "cherry tomatoe", "cherry tomato"}. Two names are the
+    same food if their forms overlap, so "egg" matches "eggs" and
+    "strawberry" matches "strawberries"."""
+    forms = {name}
+    if name.endswith("ies"):
+        forms.add(name[:-3] + "y")
+    if name.endswith("es"):
+        forms.add(name[:-2])
+    if name.endswith("s") and not name.endswith("ss"):
+        forms.add(name[:-1])
+    return forms
+
 def _find_item(items: dict, name: str) -> tuple[str, dict] | tuple[None, None]:
-    """(stored name, item) for a case-insensitive match in one location's items."""
+    """(stored name, item) in one location's items, ignoring case and
+    singular/plural. An exact match wins over a plural match."""
+    forms = _singular_forms(name)
+    match = (None, None)
     for stored, item in items.items():
-        if _normalize_name(stored) == name:
+        other = _normalize_name(stored)
+        if other == name:
             return stored, item
-    return None, None
+        if forms & _singular_forms(other):
+            match = (stored, item)
+    return match
 
 def _similar_items(name: str, cutoff: float, skip: tuple[str, str] | None = None) -> list[str]:
     """Items anywhere that look like the same food as name, as "name (location)".
@@ -249,7 +269,7 @@ def add_item(
     a distinguishing word only when two different things would otherwise
     share a name ("chocolate whey protein" vs "unflavored whey protein").
     It's trimmed and lowercased, and matches existing items regardless of
-    case. Put brand, variety, and package size in details instead, e.g.
+    case or singular/plural ("egg" adds to "eggs"). Put brand, variety, and package size in details instead, e.g.
     details="Trader Joe's California Golden, 16oz bag". details is kept
     when left blank on a later add.
 
@@ -332,8 +352,8 @@ def remove_item(name: str, location: str = "fridge") -> str:
     """Remove a food item from the inventory entirely (used up or thrown
     out). To subtract part of an item, use use_item instead.
 
-    name matches regardless of case; if nothing matches, the response
-    suggests similar items and where they are.
+    name matches regardless of case or singular/plural ("egg" finds
+    "eggs"); if nothing matches, the response suggests similar items and where they are.
 
     location is the storage location the item is in, e.g. "fridge"
     (default), "freezer", or "pantry" — any location string works. It's
@@ -344,13 +364,15 @@ def remove_item(name: str, location: str = "fridge") -> str:
     if error := _check_location(location):
         return error
     name = _normalize_name(name)
-    if not _delete_item(location, name):
+    stored_name, _ = _find_item(_get_items(location).get(location, {}), name)
+    if stored_name is None or not _delete_item(location, stored_name):
         msg = f"'{name}' is not in the {location}."
         if similar := _similar_items(name, 0.6):
             msg += f" Did you mean: {', '.join(similar)}?"
         else:
             msg += f" Existing locations: {_format_locations(_get_locations())}."
         return msg
+    name = stored_name
     items = _get_items(location).get(location)
     if not items:
         return f"Removed '{name}' from the {location}. The {location} is now empty."
@@ -368,8 +390,8 @@ def use_item(name: str, quantity: str, location: str = "fridge") -> str:
     back with the remaining amount, keeping its details. If what's used
     reaches or exceeds what's stored, the item is removed.
 
-    name matches regardless of case; if nothing matches, the response
-    suggests similar items and where they are. location is the storage
+    name matches regardless of case or singular/plural ("egg" finds
+    "eggs"); if nothing matches, the response suggests similar items and where they are. location is the storage
     location the item is in, e.g. "fridge" (default), "freezer", or
     "pantry".
     """
