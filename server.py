@@ -152,13 +152,14 @@ def _similar_items(name: str, cutoff: float, skip: tuple[str, str] | None = None
     """Items anywhere that look like the same food as name, as "name (location)".
 
     Similar means one name's words contain the other's ("raisins" vs "golden
-    raisins") or the spelling is close ("rasins" vs "raisins"). skip is a
-    (location, name) pair to leave out.
+    raisins"), the spelling is close ("rasins" vs "raisins"), or name shows
+    up in the item's details ("皮蛋" matches century eggs, details "皮蛋").
+    skip is a (location, name) pair to leave out.
     """
     words = set(name.split())
     matches = []
     for loc, items in _get_items().items():
-        for stored in items:
+        for stored, item in items.items():
             other = _normalize_name(stored)
             if (loc, other) == skip:
                 continue
@@ -167,9 +168,18 @@ def _similar_items(name: str, cutoff: float, skip: tuple[str, str] | None = None
                 words <= other_words
                 or other_words <= words
                 or difflib.SequenceMatcher(None, name, other).ratio() >= cutoff
+                or _in_details(name, item["details"])
             ):
                 matches.append(f"{stored} ({loc})")
     return matches
+
+def _in_details(name: str, details: str) -> bool:
+    """True if name appears in details: as whole words for Latin-script names,
+    as a substring otherwise (Chinese has no spaces between words)."""
+    details = details.lower()
+    if name.isascii():
+        return set(name.split()) <= set(re.findall(r"\w+", details))
+    return name in details
 
 def _normalize_location(location: str) -> str:
     return location.strip().lower()
@@ -199,6 +209,18 @@ def _parse_quantity(s: str) -> tuple[float, str] | tuple[None, None]:
     if not match:
         return None, None
     return float(match.group(1)), match.group(2).strip()
+
+def _same_unit(stored: str, used: str, name: str) -> bool:
+    """Units match ignoring plurals ("bag" == "bags"). A bare used number
+    matches any stored unit. A bare stored count only matches a bare number
+    or the item itself as the unit ("2 eggs" from "10" eggs, not "4 oz")."""
+    def singular(word: str) -> str:
+        return word.lower().rstrip("s")
+    if not used:
+        return True
+    if not stored:
+        return singular(used) in {singular(w) for w in name.split()}
+    return singular(stored) == singular(used)
 
 def _format_number(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
@@ -307,7 +329,8 @@ def add_item(
 
 @mcp.tool()
 def remove_item(name: str, location: str = "fridge") -> str:
-    """Remove a food item from the inventory (used up or thrown out).
+    """Remove a food item from the inventory entirely (used up or thrown
+    out). To subtract part of an item, use use_item instead.
 
     name matches regardless of case; if nothing matches, the response
     suggests similar items and where they are.
@@ -332,6 +355,54 @@ def remove_item(name: str, location: str = "fridge") -> str:
     if not items:
         return f"Removed '{name}' from the {location}. The {location} is now empty."
     return f"Removed '{name}' from the {location}. Current {location}: {items}"
+
+@mcp.tool()
+def use_item(name: str, quantity: str, location: str = "fridge") -> str:
+    """Subtract an amount of a food item that was partly used, e.g. 2 of 10
+    eggs for a recipe. Use remove_item instead when it's all used up.
+
+    quantity is the amount used, e.g. "2" or "1 cup", in the same unit the
+    item is stored in (see list_inventory). If the units don't match (item
+    stored as "1 bag", used "4 oz") or the stored quantity isn't a number,
+    nothing changes: work out what's left, then remove_item and add_item it
+    back with the remaining amount, keeping its details. If what's used
+    reaches or exceeds what's stored, the item is removed.
+
+    name matches regardless of case; if nothing matches, the response
+    suggests similar items and where they are. location is the storage
+    location the item is in, e.g. "fridge" (default), "freezer", or
+    "pantry".
+    """
+    location = _normalize_location(location)
+    if error := _check_location(location):
+        return error
+    name = _normalize_name(name)
+    stored_name, item = _find_item(_get_items(location).get(location, {}), name)
+    if item is None:
+        msg = f"'{name}' is not in the {location}."
+        if similar := _similar_items(name, 0.6):
+            msg += f" Did you mean: {', '.join(similar)}?"
+        return msg
+    have, have_unit = _parse_quantity(item["quantity"])
+    used, used_unit = _parse_quantity(quantity)
+    if used is None or used <= 0:
+        return f"quantity must start with a positive number, e.g. \"2\" or \"1 cup\", got '{quantity}'."
+    if have is None or not _same_unit(have_unit, used_unit, stored_name):
+        return (
+            f"Can't subtract '{quantity}' from '{stored_name}' ({item['quantity']}) "
+            "automatically. Work out what's left, then remove_item and add_item it "
+            "back with the remaining amount, keeping its details."
+        )
+    remaining = have - used
+    if remaining <= 0:
+        _delete_item(location, stored_name)
+        return f"Used {quantity} of '{stored_name}' — that's all of it, so it was removed from the {location}."
+    item["quantity"] = f"{_format_number(remaining)} {have_unit or used_unit}".strip()
+    _upsert_item(location, stored_name, item)
+    msg = f"Used {quantity} of '{stored_name}'. {item['quantity']} left in the {location}."
+    if _is_low(item):
+        msg += f"\n⚠️ '{stored_name}' is running low (threshold {item['low_threshold']})."
+    return msg
 
 @mcp.tool()
 def remove_location(location: str) -> str:

@@ -18,8 +18,10 @@ def cleanup_and_guard_fridge_freezer():
     before = {loc: server._get_items(loc).get(loc, {}) for loc in ("fridge", "freezer")}
     locations_before = server._get_locations()
     yield
-    server._delete_item("pantry", ITEM)
-    server._delete_item(NEW_LOCATION, ITEM)
+    for loc, items in server._get_items().items():
+        for name in items:
+            if ITEM in name:
+                server._delete_item(loc, name)
     for loc in set(server._get_locations()) - set(locations_before):
         server._delete_location(loc)
     after = {loc: server._get_items(loc).get(loc, {}) for loc in ("fridge", "freezer")}
@@ -107,3 +109,54 @@ def test_similar_item_hints():
     assert "Did you mean" in msg and f"{ITEM} (pantry)" in msg
 
     server.remove_item(ITEM, location="pantry")
+
+
+def test_use_item_subtracts_partial_amounts():
+    server.add_item(ITEM, quantity="10", location="pantry", low_threshold="3")
+
+    msg = server.use_item(ITEM.upper(), "2", location="pantry")
+    assert "8 left in the pantry" in msg
+    assert "⚠️" in server.use_item(ITEM, "5", location="pantry")  # 3 left, at threshold
+
+    # Mismatched units change nothing and explain the workaround.
+    assert "Can't subtract" in server.use_item(ITEM, "4 oz", location="pantry")
+    assert server._get_items("pantry")["pantry"][ITEM]["quantity"] == "3"
+
+    msg = server.use_item(ITEM, "5", location="pantry")
+    assert "removed" in msg
+    assert ITEM not in server._get_items("pantry")["pantry"]
+
+
+def test_use_item_with_units_and_bad_input():
+    server.add_item(ITEM, quantity="3 bags", location="pantry")
+    assert "2 bags left" in server.use_item(ITEM, "1 bag", location="pantry")
+    assert "positive number" in server.use_item(ITEM, "-1", location="pantry")
+    assert "not in the fridge" in server.use_item(ITEM, "1", location="fridge")
+    server.remove_item(ITEM, location="pantry")
+
+
+def test_details_match_other_languages():
+    tag = f"测试{ITEM[-8:]}"
+    server.add_item(ITEM, location="pantry", details=f"Test Brand, {tag}")
+
+    msg = server.remove_item(tag, location="pantry")
+    assert "Did you mean" in msg and f"{ITEM} (pantry)" in msg
+    msg = server.use_item(tag, "1", location="fridge")
+    assert f"{ITEM} (pantry)" in msg
+    assert f"{ITEM} (pantry)" in server.add_item(tag, location="pantry")
+    server.remove_item(tag, location="pantry")
+
+    # Latin-script names match whole words in details, not fragments.
+    assert f"{ITEM} (pantry)" in server.remove_item("test brand", location="fridge")
+    assert f"{ITEM} (pantry)" not in server.remove_item("bran", location="fridge")
+
+    server.remove_item(ITEM, location="pantry")
+
+
+def test_use_item_accepts_item_name_as_unit():
+    name = f"{ITEM} eggs"
+    server.add_item(name, quantity="10", location="pantry")
+    assert "8 eggs left" in server.use_item(name, "2 eggs", location="pantry")
+    assert "7 eggs left" in server.use_item(name, "1 egg", location="pantry")
+    assert "Can't subtract" in server.use_item(name, "4 oz", location="pantry")
+    server.remove_item(name, location="pantry")
