@@ -77,3 +77,33 @@ def test_empty_location_persists_until_removed():
 def test_rejects_empty_and_reserved_locations():
     assert "can't be empty" in server.add_item(ITEM, location="   ")
     assert "reserved" in server.add_item(ITEM, location="all")
+
+
+def test_names_are_normalized_and_matched_case_insensitively():
+    msg = server.add_item(f"  {ITEM.upper()} ", quantity="2 bags", location="pantry",
+                          details="Test Brand, 16oz bag")
+    assert f"Added '{ITEM}' to the pantry." in msg
+
+    # Same food in different case sums into one row and keeps details.
+    server.add_item(ITEM.title(), quantity="1 bag", location="pantry")
+    item = server._get_items("pantry")["pantry"][ITEM]
+    assert item["quantity"] == "3 bag"
+    assert item["details"] == "Test Brand, 16oz bag"
+
+    assert "Removed" in server.remove_item(ITEM.upper(), location="pantry")
+
+
+def test_similar_item_hints():
+    server.add_item(ITEM, location="pantry")
+
+    # A plural/extra-word variant is flagged as possibly the same food.
+    variant = f"golden {ITEM}"
+    msg = server.add_item(variant, location="pantry")
+    assert f"Similar items already in the inventory: {ITEM} (pantry)" in msg
+    server.remove_item(variant, location="pantry")
+
+    # Removing a misspelling suggests the real item and its location.
+    msg = server.remove_item(ITEM[:-1], location="fridge")
+    assert "Did you mean" in msg and f"{ITEM} (pantry)" in msg
+
+    server.remove_item(ITEM, location="pantry")

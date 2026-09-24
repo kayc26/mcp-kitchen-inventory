@@ -5,6 +5,7 @@ actually in your kitchen. This server hands it that: add, remove, and list
 food items across any storage location (fridge, freezer, pantry, ...), with
 low-stock flags. See docs/adr/ for every choice made here.
 """
+import difflib
 import os
 import re
 
@@ -46,6 +47,7 @@ def _init_db() -> None:
                 PRIMARY KEY (location, name)
             )
         """)
+        conn.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS details TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE TABLE IF NOT EXISTS locations (name TEXT PRIMARY KEY)")
         # Backfill: fridge and freezer always existed before locations were
         # free-form, plus any location already holding items.
@@ -63,7 +65,7 @@ def _get_items(location: str | None = None) -> dict:
     Every known location appears (empty ones as {}), common locations first.
     A specific location that isn't known returns {}.
     """
-    query = "SELECT location, name, quantity, expiry, made_date, low_threshold FROM items"
+    query = "SELECT location, name, quantity, details, expiry, made_date, low_threshold FROM items"
     params = ()
     if location is not None:
         query += " WHERE location = %s"
@@ -72,9 +74,10 @@ def _get_items(location: str | None = None) -> dict:
         rows = conn.execute(query, params).fetchall()
     known = _get_locations()
     data = {loc: {} for loc in known if location is None or loc == location}
-    for loc, name, quantity, expiry, made_date, low_threshold in rows:
+    for loc, name, quantity, details, expiry, made_date, low_threshold in rows:
         data.setdefault(loc, {})[name] = {
             "quantity": quantity,
+            "details": details,
             "expiry": expiry,
             "made_date": made_date,
             "low_threshold": low_threshold,
@@ -99,15 +102,19 @@ def _upsert_item(location: str, name: str, item: dict) -> None:
         )
         conn.execute(
             """
-            INSERT INTO items (location, name, quantity, expiry, made_date, low_threshold)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO items (location, name, quantity, details, expiry, made_date, low_threshold)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (location, name) DO UPDATE SET
                 quantity = EXCLUDED.quantity,
+                details = EXCLUDED.details,
                 expiry = EXCLUDED.expiry,
                 made_date = EXCLUDED.made_date,
                 low_threshold = EXCLUDED.low_threshold
             """,
-            (location, name, item["quantity"], item["expiry"], item["made_date"], item["low_threshold"]),
+            (
+                location, name, item["quantity"], item["details"],
+                item["expiry"], item["made_date"], item["low_threshold"],
+            ),
         )
 
 def _delete_location(location: str) -> bool:
@@ -123,10 +130,46 @@ def _delete_location(location: str) -> bool:
         return cur.rowcount > 0
 
 def _delete_item(location: str, name: str) -> bool:
-    """True if a row was deleted."""
+    """True if a row was deleted. name matches case-insensitively."""
     with _get_conn() as conn:
-        cur = conn.execute("DELETE FROM items WHERE location = %s AND name = %s", (location, name))
+        cur = conn.execute(
+            "DELETE FROM items WHERE location = %s AND lower(name) = lower(%s)", (location, name)
+        )
         return cur.rowcount > 0
+
+def _normalize_name(name: str) -> str:
+    """Trim, collapse whitespace, lowercase: "  Golden  Raisins " -> "golden raisins"."""
+    return " ".join(name.split()).lower()
+
+def _find_item(items: dict, name: str) -> tuple[str, dict] | tuple[None, None]:
+    """(stored name, item) for a case-insensitive match in one location's items."""
+    for stored, item in items.items():
+        if _normalize_name(stored) == name:
+            return stored, item
+    return None, None
+
+def _similar_items(name: str, cutoff: float, skip: tuple[str, str] | None = None) -> list[str]:
+    """Items anywhere that look like the same food as name, as "name (location)".
+
+    Similar means one name's words contain the other's ("raisins" vs "golden
+    raisins") or the spelling is close ("rasins" vs "raisins"). skip is a
+    (location, name) pair to leave out.
+    """
+    words = set(name.split())
+    matches = []
+    for loc, items in _get_items().items():
+        for stored in items:
+            other = _normalize_name(stored)
+            if (loc, other) == skip:
+                continue
+            other_words = set(other.split())
+            if (
+                words <= other_words
+                or other_words <= words
+                or difflib.SequenceMatcher(None, name, other).ratio() >= cutoff
+            ):
+                matches.append(f"{stored} ({loc})")
+    return matches
 
 def _normalize_location(location: str) -> str:
     return location.strip().lower()
@@ -174,8 +217,23 @@ def add_item(
     made_date: str = "",
     low_threshold: str = "",
     location: str = "fridge",
+    details: str = "",
 ) -> str:
     """Add a food item to the inventory at a storage location.
+
+    name is the short, generic, everyday name you'd say out loud: "raisins",
+    "cheddar", "broccoli", "chinese sausage" — not the brand or package
+    name, and not "frozen broccoli" (the location already says that). Add
+    a distinguishing word only when two different things would otherwise
+    share a name ("chocolate whey protein" vs "unflavored whey protein").
+    It's trimmed and lowercased, and matches existing items regardless of
+    case. Put brand, variety, and package size in details instead, e.g.
+    details="Trader Joe's California Golden, 16oz bag". details is kept
+    when left blank on a later add.
+
+    The response lists similar items already in the inventory (e.g. adding
+    "raisin" when "raisins" exists). If one is the same food, remove this
+    new item and add to that one instead, so there's one row per food.
 
     If the item is already there and both the existing and new quantities
     start with a number (e.g. "3" + "2" -> "5", "1 cup" + "2 cups" -> "3
@@ -185,8 +243,9 @@ def add_item(
     know how to convert "half a carton" + "2" into a total. In that case,
     call list_inventory first, work out the new total yourself (using
     whatever real-world conversion applies), and pass that total here as
-    the quantity. expiry, made_date, and low_threshold always overwrite,
-    regardless.
+    the quantity. Keep quantity to the count and unit ("2 bags", "8 oz") and
+    put pack sizes in details, so later adds can be summed. expiry,
+    made_date, and low_threshold always overwrite, regardless.
 
     location is any storage location, e.g. "fridge" (default), "freezer",
     or "pantry" — these are common examples, not a fixed list. It's
@@ -207,9 +266,14 @@ def add_item(
     location = _normalize_location(location)
     if error := _check_location(location):
         return error
+    name = _normalize_name(name)
+    if not name:
+        return "name can't be empty."
     existing_locations = _get_locations()
-    existing = _get_items(location).get(location, {}).get(name)
+    stored_name, existing = _find_item(_get_items(location).get(location, {}), name)
     if existing is not None:
+        name = stored_name
+        details = details or existing["details"]
         old_number, old_unit = _parse_quantity(existing["quantity"])
         new_number, new_unit = _parse_quantity(quantity)
         if old_number is not None and new_number is not None:
@@ -217,6 +281,7 @@ def add_item(
             quantity = f"{_format_number(old_number + new_number)} {unit}".strip()
     item = {
         "quantity": quantity,
+        "details": details,
         "expiry": expiry,
         "made_date": made_date,
         "low_threshold": low_threshold,
@@ -231,6 +296,11 @@ def add_item(
             "typo, remove the item, add it again under the right location, and "
             f"call remove_location('{location}')."
         )
+    if existing is None and (similar := _similar_items(name, 0.85, skip=(location, name))):
+        msg += (
+            f"\n🔎 Similar items already in the inventory: {', '.join(similar)}. "
+            f"If '{name}' is the same food, remove it and add to that item instead."
+        )
     if _is_low(item):
         msg += f"\n⚠️ '{name}' is already at or below its low-stock threshold."
     return msg
@@ -238,6 +308,9 @@ def add_item(
 @mcp.tool()
 def remove_item(name: str, location: str = "fridge") -> str:
     """Remove a food item from the inventory (used up or thrown out).
+
+    name matches regardless of case; if nothing matches, the response
+    suggests similar items and where they are.
 
     location is the storage location the item is in, e.g. "fridge"
     (default), "freezer", or "pantry" — any location string works. It's
@@ -247,11 +320,14 @@ def remove_item(name: str, location: str = "fridge") -> str:
     location = _normalize_location(location)
     if error := _check_location(location):
         return error
+    name = _normalize_name(name)
     if not _delete_item(location, name):
-        return (
-            f"'{name}' is not in the {location}. Existing locations: "
-            f"{_format_locations(_get_locations())}."
-        )
+        msg = f"'{name}' is not in the {location}."
+        if similar := _similar_items(name, 0.6):
+            msg += f" Did you mean: {', '.join(similar)}?"
+        else:
+            msg += f" Existing locations: {_format_locations(_get_locations())}."
+        return msg
     items = _get_items(location).get(location)
     if not items:
         return f"Removed '{name}' from the {location}. The {location} is now empty."
