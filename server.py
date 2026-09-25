@@ -1,10 +1,11 @@
-"""fridge-inventory — a food inventory a model has no way to see.
+"""kitchen-inventory — a food inventory a model has no way to see.
 
 An AI model only knows what's in its context window — it can't see what's
 actually in your kitchen. This server hands it that: add, remove, and list
 food items across any storage location (fridge, freezer, pantry, ...), with
 low-stock flags. See docs/adr/ for every choice made here.
 """
+import datetime
 import difflib
 import os
 import re
@@ -13,7 +14,7 @@ import psycopg
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
-    "fridge-inventory",
+    "kitchen-inventory",
     instructions=(
         "A food inventory: what food is on hand, where it's stored, how much "
         "is left, and when it expires. Each item has a free-form storage "
@@ -245,6 +246,33 @@ def _same_unit(stored: str, used: str, name: str) -> bool:
 def _format_number(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
 
+LEFTOVER_DAYS = 4
+
+def _leftover_expiry(made_date: str) -> str:
+    """made_date + LEFTOVER_DAYS as YYYY-MM-DD, or "" if made_date isn't a
+    YYYY-MM-DD date."""
+    try:
+        made = datetime.datetime.strptime(made_date.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    return (made + datetime.timedelta(days=LEFTOVER_DAYS)).isoformat()
+
+def _backfill_leftover_expiry(conn: psycopg.Connection) -> int:
+    """Give rows with a made_date but no expiry expiry = made_date + 4 days.
+    Returns how many rows changed; unparseable made_dates are left alone."""
+    rows = conn.execute(
+        "SELECT location, name, made_date FROM items WHERE expiry = '' AND made_date <> ''"
+    ).fetchall()
+    changed = 0
+    for location, name, made_date in rows:
+        if expiry := _leftover_expiry(made_date):
+            conn.execute(
+                "UPDATE items SET expiry = %s WHERE location = %s AND name = %s AND expiry = ''",
+                (expiry, location, name),
+            )
+            changed += 1
+    return changed
+
 def _is_low(item: dict) -> bool:
     """True if quantity has dropped to or below the item's low_threshold."""
     threshold = _leading_number(item.get("low_threshold", ""))
@@ -298,7 +326,9 @@ def add_item(
 
     expiry and made_date are optional, format YYYY-MM-DD. made_date is for
     things you cooked or prepped yourself (leftovers, meal components) — use
-    it instead of expiry when there's no package date to go by.
+    it instead of expiry when there's no package date to go by. When
+    made_date is given and expiry is blank, expiry is set to made_date + 4
+    days, and the response says so; a given expiry always wins.
 
     low_threshold is optional, e.g. "2" or "2 cups" — when quantity drops to
     or below this amount, the item is flagged as running low in
@@ -321,6 +351,8 @@ def add_item(
         if old_number is not None and new_number is not None:
             unit = new_unit or old_unit
             quantity = f"{_format_number(old_number + new_number)} {unit}".strip()
+    leftover_expiry = "" if expiry else _leftover_expiry(made_date)
+    expiry = expiry or leftover_expiry
     item = {
         "quantity": quantity,
         "details": details,
@@ -331,6 +363,8 @@ def add_item(
     _upsert_item(location, name, item)
     items = _get_items(location)[location]
     msg = f"Added '{name}' to the {location}. Current {location}: {items}"
+    if leftover_expiry:
+        msg += f"\n🗓️ Expiry set to {expiry} (made_date {made_date} + {LEFTOVER_DAYS} days)."
     if location not in existing_locations:
         msg += (
             f"\n🆕 Created new location '{location}'. Existing locations: "
@@ -496,12 +530,6 @@ def check_low_stock(location: str = "all") -> str:
     if not low:
         return "Nothing is running low."
     return "Running low:\n" + "\n".join(f"{loc}: {items}" for loc, items in low.items())
-
-@mcp.tool()
-def my_tool() -> str:
-    """YOURS. Rename it, give it a real purpose, make the model reach
-    something it couldn't before. (Track ideas: docs/TRACKS.md)"""
-    return "Not built yet — that's the point. Edit server.py."
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")

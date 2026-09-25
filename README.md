@@ -1,4 +1,4 @@
-# fridge-inventory — the CAM MCP starter
+# kitchen-inventory — the CAM MCP starter
 
 *A rig for your experiments, not a finished thing. Cloned in Session 3 of
 Computationally Assisted Metacognition (CIS 7000, Penn, Fall 2026).*
@@ -14,8 +14,9 @@ model cannot.
 
 - `server.py` — a small, working MCP server: a food inventory
   tracker (fridge, freezer, pantry, or any location you name) backed by
-  Postgres. Four tools work; one is a stub with your name
-  on it.
+  Postgres. Six tools: `list_inventory`, `add_item`, `use_item`,
+  `remove_item`, `remove_location`, `check_low_stock`. Leftovers added with
+  a `made_date` and no `expiry` get `expiry = made_date + 4 days`.
 - `docs/adr/` — **the choices live here, not in the code.** Every decision
   this repo made for you is written down with its reasons, so you inherit
   understanding, not just files. Disagree with one? Write the next ADR.
@@ -56,7 +57,7 @@ the browser claude.ai can't — it calls from the cloud, which is exactly why
 deployment exists):
 
 ```bash
-claude mcp add --transport http fridge-inventory http://localhost:8000/mcp
+claude mcp add --transport http kitchen-inventory http://localhost:8000/mcp
 ```
 
 Ask it: *"What's in my fridge? Add 2 eggs, expiry 2026-10-01."* The model
@@ -81,7 +82,7 @@ The tunnel dies with your terminal. For an instrument that outlives your laptop:
 1. **render.com** → Sign in **with GitHub** (the account holding your repo).
 2. **New +** → **Blueprint** → select your repo → **Apply**. (`render.yaml` does the rest.)
 3. ~2 minutes of build → copy your `https://….onrender.com` URL.
-4. claude.ai → Settings → Connectors → edit `fridge-inventory` → swap URL to the Render one + `/mcp`.
+4. claude.ai → Settings → Connectors → edit `kitchen-inventory` → swap URL to the Render one + `/mcp`.
 
 Free-tier truth (ADR-0003): the instance naps when idle — first call after a nap
 takes ~30s. Fine for an instrument; now you know why.
