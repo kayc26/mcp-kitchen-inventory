@@ -9,6 +9,7 @@ import datetime
 import difflib
 import os
 import re
+from zoneinfo import ZoneInfo
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
@@ -247,6 +248,13 @@ def _format_number(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
 
 LEFTOVER_DAYS = 4
+
+# "Today" is the date in Eastern time, not the host's clock: Render runs in
+# UTC, which would roll over to tomorrow at 8pm.
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+def _today() -> datetime.date:
+    return datetime.datetime.now(LOCAL_TZ).date()
 
 def _leftover_expiry(made_date: str) -> str:
     """made_date + LEFTOVER_DAYS as YYYY-MM-DD, or "" if made_date isn't a
@@ -530,6 +538,50 @@ def check_low_stock(location: str = "all") -> str:
     if not low:
         return "Nothing is running low."
     return "Running low:\n" + "\n".join(f"{loc}: {items}" for loc, items in low.items())
+
+@mcp.tool()
+def get_expiring(days: int = 7, include_expired: bool = True) -> dict:
+    """Items expiring within `days` days, plus already-expired ones. Use this
+    for 'what's expiring' and the weekly review instead of scanning list_inventory.
+
+    Returns items whose expiry is on or before today + days, soonest first,
+    each with name, location, quantity, expiry, and days_left (negative =
+    already expired). include_expired=false leaves out items with
+    days_left < 0. Items with no expiry aren't listed; no_expiry_count says
+    how many there are. unparseable_count is how many have an expiry that
+    isn't a YYYY-MM-DD date.
+    """
+    today = _today()
+    expiring = []
+    no_expiry_count = 0
+    unparseable_count = 0
+    for loc, items in _get_items().items():
+        for name, item in items.items():
+            if not item["expiry"].strip():
+                no_expiry_count += 1
+                continue
+            try:
+                expiry = datetime.date.fromisoformat(item["expiry"].strip())
+            except ValueError:
+                unparseable_count += 1
+                continue
+            days_left = (expiry - today).days
+            if days_left > days or (days_left < 0 and not include_expired):
+                continue
+            expiring.append({
+                "name": name,
+                "location": loc,
+                "quantity": item["quantity"],
+                "expiry": expiry.isoformat(),
+                "days_left": days_left,
+            })
+    expiring.sort(key=lambda i: (i["expiry"], i["name"], i["location"]))
+    return {
+        "today": today.isoformat(),
+        "items": expiring,
+        "no_expiry_count": no_expiry_count,
+        "unparseable_count": unparseable_count,
+    }
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
