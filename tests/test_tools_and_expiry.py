@@ -27,7 +27,7 @@ def test_exposed_tools():
     names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
     assert names == {
         "list_inventory", "add_item", "use_item",
-        "remove_item", "remove_location", "check_low_stock", "get_expiring",
+        "update_item", "remove_item", "remove_location", "check_low_stock", "get_expiring",
     }
     assert not hasattr(server, "my_tool")
 

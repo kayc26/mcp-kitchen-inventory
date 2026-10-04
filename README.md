@@ -14,7 +14,7 @@ model cannot.
 
 - `server.py` — a small, working MCP server: a food inventory
   tracker (fridge, freezer, pantry, or any location you name) backed by
-  Postgres. Seven tools: `list_inventory`, `add_item`, `use_item`,
+  Postgres. Eight tools: `list_inventory`, `add_item`, `use_item`, `update_item`,
   `remove_item`, `remove_location`, `check_low_stock`, `get_expiring`. Leftovers added with
   a `made_date` and no `expiry` get `expiry = made_date + 4 days`.
 - `docs/adr/` — **the choices live here, not in the code.** Every decision

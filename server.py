@@ -139,6 +139,25 @@ def _delete_item(location: str, name: str) -> bool:
         )
         return cur.rowcount > 0
 
+def _update_field(location: str, name: str, field: str, value: str) -> bool:
+    """Set one column on one item in a single transaction, creating the
+    location first if field is "location". False (and nothing changed) if
+    that would collide with another item's (location, name)."""
+    assert field in UPDATABLE_FIELDS
+    try:
+        with _get_conn() as conn:
+            if field == "location":
+                conn.execute(
+                    "INSERT INTO locations (name) VALUES (%s) ON CONFLICT DO NOTHING", (value,)
+                )
+            conn.execute(
+                f"UPDATE items SET {field} = %s WHERE location = %s AND name = %s",
+                (value, location, name),
+            )
+    except psycopg.errors.UniqueViolation:
+        return False
+    return True
+
 def _normalize_name(name: str) -> str:
     """Trim, collapse whitespace, lowercase: "  Golden  Raisins " -> "golden raisins"."""
     return " ".join(name.split()).lower()
@@ -203,6 +222,16 @@ def _in_details(name: str, details: str) -> bool:
         return set(name.split()) <= set(re.findall(r"\w+", details))
     return name in details
 
+def _not_found(name: str, location: str) -> str:
+    """'name' isn't in location, plus similar items anywhere or, failing
+    that, the existing locations."""
+    msg = f"'{name}' is not in the {location}."
+    if similar := _similar_items(name, 0.6):
+        msg += f" Did you mean: {', '.join(similar)}?"
+    else:
+        msg += f" Existing locations: {_format_locations(_get_locations())}."
+    return msg
+
 def _normalize_location(location: str) -> str:
     return location.strip().lower()
 
@@ -246,6 +275,20 @@ def _same_unit(stored: str, used: str, name: str) -> bool:
 
 def _format_number(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
+
+UPDATABLE_FIELDS = ("name", "details", "location", "quantity", "expiry", "made_date", "low_threshold")
+REQUIRED_FIELDS = ("name", "location", "quantity")
+DATE_FIELDS = ("expiry", "made_date")
+
+def _is_date(s: str) -> bool:
+    """True if s is a real date written exactly YYYY-MM-DD."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return False
+    try:
+        datetime.date.fromisoformat(s)
+    except ValueError:
+        return False
+    return True
 
 LEFTOVER_DAYS = 4
 
@@ -329,7 +372,7 @@ def add_item(
     or "pantry" — these are common examples, not a fixed list. It's
     trimmed and lowercased. A location that doesn't exist yet is created,
     and the response says so and lists the existing locations, so double
-    check it wasn't a typo (if it was, move the item and call
+    check it wasn't a typo (if it was, move the item with update_item and call
     remove_location on the typo).
 
     expiry and made_date are optional, format YYYY-MM-DD. made_date is for
@@ -408,12 +451,7 @@ def remove_item(name: str, location: str = "fridge") -> str:
     name = _normalize_name(name)
     stored_name, _ = _find_item(_get_items(location).get(location, {}), name)
     if stored_name is None or not _delete_item(location, stored_name):
-        msg = f"'{name}' is not in the {location}."
-        if similar := _similar_items(name, 0.6):
-            msg += f" Did you mean: {', '.join(similar)}?"
-        else:
-            msg += f" Existing locations: {_format_locations(_get_locations())}."
-        return msg
+        return _not_found(name, location)
     name = stored_name
     items = _get_items(location).get(location)
     if not items:
@@ -428,8 +466,8 @@ def use_item(name: str, quantity: str, location: str = "fridge") -> str:
     quantity is the amount used, e.g. "2" or "1 cup", in the same unit the
     item is stored in (see list_inventory). If the units don't match (item
     stored as "1 bag", used "4 oz") or the stored quantity isn't a number,
-    nothing changes: work out what's left, then remove_item and add_item it
-    back with the remaining amount, keeping its details. If what's used
+    nothing changes: work out what's left, then use update_item with field
+    quantity and the remaining amount instead. If what's used
     reaches or exceeds what's stored, the item is removed.
 
     name matches regardless of case or singular/plural ("egg" finds
@@ -467,6 +505,91 @@ def use_item(name: str, quantity: str, location: str = "fridge") -> str:
     if _is_low(item):
         msg += f"\n⚠️ '{stored_name}' is running low (threshold {item['low_threshold']})."
     return msg
+
+@mcp.tool()
+def update_item(name: str, field: str, value: str, location: str = "fridge") -> dict:
+    """Change one field on an item: expiry, location, quantity, name,
+    details, made_date, or low_threshold. Use this instead of remove_item +
+    add_item. Changing made_date or location does not change expiry: ask
+    Kay whether expiry should change too, and suggest a date (made_date + 4
+    days for leftovers, or the new location's shelf life when moving).
+
+    name and location find the item the same way remove_item does: name
+    matches regardless of case or singular/plural ("egg" finds "eggs"),
+    location defaults to "fridge", and if nothing matches, the error
+    suggests similar items and where they are.
+
+    value is the new value for field, checked like add_item: name is
+    trimmed and lowercased; location is trimmed and lowercased, and a new
+    location is created and reported; expiry and made_date must be
+    YYYY-MM-DD. An empty value clears details, expiry, made_date, or
+    low_threshold; name, location, and quantity can't be cleared. A rename
+    or move onto an item that already has that name at that location is
+    refused and nothing changes; the two are never merged.
+
+    Returns the full updated item and the field's previous value, or
+    {"error": ...} if nothing changed.
+    """
+    location = _normalize_location(location)
+    if error := _check_location(location):
+        return {"error": error}
+    field = field.strip().lower()
+    if field not in UPDATABLE_FIELDS:
+        return {"error": f"field must be one of {', '.join(UPDATABLE_FIELDS)}, got '{field}'."}
+    name = _normalize_name(name)
+    items = _get_items(location).get(location, {})
+    stored_name, item = _find_item(items, name)
+    if item is None:
+        return {"error": _not_found(name, location)}
+
+    if not value.strip():
+        if field in REQUIRED_FIELDS:
+            return {"error": f"{field} can't be cleared."}
+        value = ""
+    elif field == "name":
+        value = _normalize_name(value)
+    elif field == "location":
+        value = _normalize_location(value)
+        if error := _check_location(value):
+            return {"error": error}
+    elif field in DATE_FIELDS:
+        value = value.strip()
+        if not _is_date(value):
+            return {"error": f"{field} must be a date written YYYY-MM-DD, got '{value}'."}
+
+    new_location = value if field == "location" else location
+    new_name = value if field == "name" else stored_name
+    if (new_location, new_name) != (location, stored_name):
+        others = _get_items(new_location).get(new_location, {})
+        others = {n: i for n, i in others.items() if (new_location, n) != (location, stored_name)}
+        clash, _ = _find_item(others, new_name)
+        if clash is not None:
+            return {"error": (
+                f"There's already '{clash}' in the {new_location}, so '{stored_name}' "
+                "wasn't changed. Nothing was merged."
+            )}
+
+    existing_locations = _get_locations()
+    previous = {"name": stored_name, "location": location, **item}[field]
+    if not _update_field(location, stored_name, field, value):
+        return {"error": (
+            f"There's already '{new_name}' in the {new_location}, so '{stored_name}' "
+            "wasn't changed. Nothing was merged."
+        )}
+
+    updated = _get_items(new_location)[new_location][new_name]
+    result = {
+        "item": {"name": new_name, "location": new_location, **updated},
+        "field": field,
+        "previous": previous,
+    }
+    if new_location not in existing_locations:
+        result["created_location"] = (
+            f"Created new location '{new_location}'. Existing locations: "
+            f"{_format_locations(existing_locations)}. If '{new_location}' was a "
+            f"typo, move the item back and call remove_location('{new_location}')."
+        )
+    return result
 
 @mcp.tool()
 def remove_location(location: str) -> str:
