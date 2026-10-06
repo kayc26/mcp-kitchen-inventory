@@ -87,6 +87,33 @@ The tunnel dies with your terminal. For an instrument that outlives your laptop:
 Free-tier truth (ADR-0003): the instance naps when idle — first call after a nap
 takes ~30s. Fine for an instrument; now you know why.
 
+## Stats endpoint
+
+`GET /stats` returns aggregate counts for a public stats page: counts only,
+never names, notes, places, or any row content. No auth, GET only, no CORS
+(it's called server to server). Errors return 500 with a short message,
+never partial data.
+
+```json
+{
+  "server": "kitchen-inventory",
+  "as_of": "2026-10-05",
+  "tools": 8,
+  "totals": {"items_tracked": 95, "locations": 4, "expired_now": 3},
+  "monthly": []
+}
+```
+
+- `as_of` — today in America/New_York, the server's timezone.
+- `tools` — number of MCP tools registered, read from the server's registry.
+- `totals.items_tracked` — rows currently in the inventory, all locations, expired included.
+- `totals.locations` — every known storage location, empty ones included.
+- `totals.expired_now` — items whose expiry is a YYYY-MM-DD date before
+  `as_of`; items with no expiry don't count.
+- `monthly` — always `[]`. Items have no created timestamp, so this server
+  keeps no history; inventory history comes from daily snapshots taken by the
+  showcase repo, not from this server.
+
 ## License
 
 MPL-2.0 with a Template Output Grant — the template stays open with attribution; what YOU build from it may be Apache-2.0 (open, attributed) or fully closed. See LICENSE + TEMPLATE-GRANT.md.

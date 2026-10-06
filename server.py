@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse, PlainTextResponse
 
 mcp = FastMCP(
     "kitchen-inventory",
@@ -705,6 +706,50 @@ def get_expiring(days: int = 7, include_expired: bool = True) -> dict:
         "no_expiry_count": no_expiry_count,
         "unparseable_count": unparseable_count,
     }
+
+# GET /stats: aggregate counts for a public stats page. Counts only, never row
+# content. No monthly series: items has no created timestamp, so inventory
+# history comes from the showcase repo's daily snapshots instead.
+
+def _count_items_tracked(conn: psycopg.Connection) -> int:
+    # Rows currently in items, all locations, expired included.
+    return conn.execute("SELECT count(*) FROM items").fetchone()[0]
+
+def _count_locations(conn: psycopg.Connection) -> int:
+    # Rows in locations, i.e. every known storage location, empty ones included.
+    return conn.execute("SELECT count(*) FROM locations").fetchone()[0]
+
+def _count_expired_now(conn: psycopg.Connection, today: datetime.date) -> int:
+    # Items whose expiry is a YYYY-MM-DD date before today (Eastern); blank or malformed expiry doesn't count.
+    return conn.execute(
+        r"SELECT count(*) FROM items WHERE expiry ~ '^\d{4}-\d{2}-\d{2}$' AND expiry < %s",
+        (today.isoformat(),),
+    ).fetchone()[0]
+
+async def _count_tools() -> int:
+    # MCP tools registered on this server, read from FastMCP's registry.
+    return len(await mcp.list_tools())
+
+@mcp.custom_route("/stats", methods=["GET"])
+async def stats(request):
+    try:
+        today = _today()
+        with _get_conn() as conn:
+            totals = {
+                "items_tracked": _count_items_tracked(conn),
+                "locations": _count_locations(conn),
+                "expired_now": _count_expired_now(conn, today),
+            }
+        tools = await _count_tools()
+    except Exception:
+        return PlainTextResponse("stats unavailable", status_code=500)
+    return JSONResponse({
+        "server": "kitchen-inventory",
+        "as_of": today.isoformat(),
+        "tools": tools,
+        "totals": totals,
+        "monthly": [],
+    })
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
