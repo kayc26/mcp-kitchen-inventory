@@ -1,7 +1,7 @@
 # 15. kitchen-inventory: sign-in with an emailed code (decided 2026-11-20, see ADR-0002)
 
 Save in the repo as docs/agent-tasks/15-oauth-sign-in.md. Built from the step 0 report
-(docs/agent-tasks/14-oauth-step-0-report.md on the auth-spike branch). Per-person
+(docs/agent-tasks/14-oauth-step-0-report.md). Per-person
 recipes and profiles (ADR-0003) are later prompts.
 
 ```
