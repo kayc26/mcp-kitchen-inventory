@@ -15,6 +15,12 @@ import psycopg
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse, PlainTextResponse
 
+import kitchen_auth
+
+# Sign-in is required (ADR-0002, task 15). Exits here if an auth env var is
+# missing, before anything else runs.
+AUTH_CONFIG = kitchen_auth.load_config()
+
 mcp = FastMCP(
     "kitchen-inventory",
     instructions=(
@@ -25,7 +31,9 @@ mcp = FastMCP(
     ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
+    **kitchen_auth.fastmcp_auth_kwargs(AUTH_CONFIG),
 )
+kitchen_auth.register_pages(mcp, AUTH_CONFIG)
 
 # Food inventory storage, backed by Neon Postgres (DATABASE_URL). Replaces the
 # earlier local JSON file, which didn't survive restarts on Render's free
@@ -751,5 +759,16 @@ async def stats(request):
         "monthly": [],
     })
 
+def build_app():
+    """The ASGI app: FastMCP's streamable-HTTP app plus the user allowlist."""
+    app = mcp.streamable_http_app()
+    kitchen_auth.install_allowlist(app, AUTH_CONFIG, mcp.settings.streamable_http_path)
+    return app
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    kitchen_auth.install_access_log_filter()
+    # Same as mcp.run(transport="streamable-http"), with the allowlist added.
+    uvicorn.run(build_app(), host=mcp.settings.host, port=mcp.settings.port,
+                log_level=mcp.settings.log_level.lower())

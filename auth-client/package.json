@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "description": "Builds static/neon-auth-client.js, the vendored @neon/auth browser client used by /login and /consent. See auth-client/README.md.",
+  "scripts": {
+    "build": "esbuild entry.js --bundle --format=esm --minify --target=es2020 --legal-comments=eof --outfile=../static/neon-auth-client.js"
+  },
+  "dependencies": {
+    "@neon/auth": "0.8.2"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
