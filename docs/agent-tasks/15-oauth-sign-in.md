@@ -13,9 +13,8 @@ anyone with the URL can read and write.
 Goal: the live server requires a signed-in, allowed user on every MCP request.
 Sign-in is OAuth with Neon Auth as the issuer and an emailed 6-digit code (Neon email
 OTP). Step 0 (task 14) proved this works from the Claude iPhone app; read its report
-first: docs/agent-tasks/14-oauth-step-0-report.md on the auth-spike branch. Reuse
-what it learned, but write the code fresh on a new branch "oauth" from main. Do not
-merge auth-spike.
+first: docs/agent-tasks/14-oauth-step-0-report.md. Reuse what it learned, but write
+the code fresh on a new branch "oauth" from main. Don't reuse the spike's code.
 
 The inventory stays shared: every allowed user sees and changes the same items. No
 tool gains a user argument, and no table changes in this task.
